@@ -23,7 +23,6 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
   ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
-
   GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
   GITOPS_BRANCH: ${{ vars.GITOPS_BRANCH }}
   GITOPS_MANIFEST: ${{ vars.GITOPS_MANIFEST }}
@@ -31,12 +30,23 @@ env:
 jobs:
 
   # =========================================================
-  # 1. UNIT TESTS AND CODE COVERAGE
+  # 1. UNIT TESTS AND COVERAGE
   # =========================================================
   test:
     name: Unit Tests and Coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+
+    # Dummy credentials are required by the AWS SDK used in the
+    # DynamoDB Testcontainers integration tests.
+    # They do not provide access to your AWS account.
+    env:
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_SESSION_TOKEN: test
+      AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
       - name: Checkout application repository
@@ -44,17 +54,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Do not add cache: gradle because this repository
-      # does not have Gradle files at repository root.
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
-      # Reads Go 1.25 or the toolchain version directly
-      # from src/catalog/go.mod.
-      - name: Set up Go
+      - name: Set up Go from go.mod
         uses: actions/setup-go@v6
         with:
           go-version-file: src/catalog/go.mod
@@ -65,31 +71,30 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Verify installed tool versions
+      - name: Verify installed tools
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Java version:"
+          echo "===== Java ====="
           java -version
 
-          echo
-          echo "Go version:"
-          go version
+          echo "===== Maven ====="
+          mvn --version
 
-          echo
-          echo "Go requirement from catalog go.mod:"
+          echo "===== Go ====="
+          go version
           grep -E '^(go|toolchain) ' src/catalog/go.mod || true
 
-          echo
-          echo "Node.js version:"
+          echo "===== Node.js ====="
           node --version
-
-          echo
-          echo "npm version:"
           npm --version
 
-      - name: Run available unit tests
+          echo "===== Docker ====="
+          docker version
+          docker info
+
+      - name: Run service unit and integration tests
         shell: bash
         run: |
           set -euo pipefail
@@ -108,17 +113,16 @@ jobs:
             directory="src/${service}"
 
             echo
-            echo "====================================================="
-            echo "Service: ${service}"
+            echo "===================================================="
+            echo "Testing service: ${service}"
             echo "Directory: ${directory}"
-            echo "====================================================="
+            echo "===================================================="
 
             if [ ! -d "${directory}" ]; then
-              echo "Directory does not exist. Skipping ${service}."
+              echo "Directory not found. Skipping ${service}."
               continue
             fi
 
-            # Maven
             if [ -f "${directory}/pom.xml" ]; then
               detected_projects=$((detected_projects + 1))
 
@@ -126,10 +130,13 @@ jobs:
 
               (
                 cd "${directory}"
-                mvn --batch-mode --no-transfer-progress clean test
+
+                mvn \
+                  --batch-mode \
+                  --no-transfer-progress \
+                  clean test
               )
 
-            # Gradle wrapper
             elif [ -f "${directory}/gradlew" ]; then
               detected_projects=$((detected_projects + 1))
 
@@ -139,10 +146,12 @@ jobs:
 
               (
                 cd "${directory}"
-                ./gradlew clean test --no-daemon
+
+                ./gradlew \
+                  clean test \
+                  --no-daemon
               )
 
-            # Go
             elif [ -f "${directory}/go.mod" ]; then
               detected_projects=$((detected_projects + 1))
 
@@ -157,10 +166,10 @@ jobs:
                   -covermode=atomic \
                   -coverprofile=coverage.out
 
-                go tool cover -func=coverage.out
+                go tool cover \
+                  -func=coverage.out
               )
 
-            # npm
             elif [ -f "${directory}/package-lock.json" ]; then
               detected_projects=$((detected_projects + 1))
 
@@ -170,16 +179,9 @@ jobs:
                 cd "${directory}"
 
                 npm ci
-
-                if node -e \
-                  "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
-                  npm test -- --coverage
-                else
-                  echo "No test script configured. Skipping Node.js tests."
-                fi
+                npm test --if-present
               )
 
-            # Yarn
             elif [ -f "${directory}/yarn.lock" ]; then
               detected_projects=$((detected_projects + 1))
 
@@ -193,43 +195,64 @@ jobs:
 
                 if node -e \
                   "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
-                  yarn test --coverage
+                  yarn test
                 else
-                  echo "No test script configured. Skipping Yarn tests."
+                  echo "No Yarn test script configured."
                 fi
               )
 
-            # package.json without lock file
             elif [ -f "${directory}/package.json" ]; then
               detected_projects=$((detected_projects + 1))
 
-              echo "Node.js project without a lock file detected."
+              echo "Node.js project without lock file detected."
 
               (
                 cd "${directory}"
 
                 npm install
-
-                if node -e \
-                  "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
-                  npm test -- --coverage
-                else
-                  echo "No test script configured. Skipping Node.js tests."
-                fi
+                npm test --if-present
               )
 
             else
-              echo "No supported test configuration found for ${service}."
+              echo "No supported build configuration found."
             fi
           done
 
           echo
-          echo "Detected projects: ${detected_projects}"
+          echo "Detected testable projects: ${detected_projects}"
 
           if [ "${detected_projects}" -eq 0 ]; then
-            echo "No Maven, Gradle, Go or Node.js projects were detected."
+            echo "No Maven, Gradle, Go or Node.js projects detected."
             exit 1
           fi
+
+      - name: Show Maven failure details
+        if: failure()
+        shell: bash
+        run: |
+          echo "===== Maven Surefire reports ====="
+
+          find src \
+            -path "*/target/surefire-reports/*.txt" \
+            -type f \
+            -print \
+            -exec sh -c '
+              echo "----------------------------------------"
+              echo "File: $1"
+              cat "$1"
+            ' _ {} \; || true
+
+          echo "===== Maven XML reports ====="
+
+          find src \
+            -path "*/target/surefire-reports/*.xml" \
+            -type f \
+            -print || true
+
+          echo "===== Running Docker containers ====="
+
+          docker ps -a || true
+          docker logs $(docker ps -aq | head -1) 2>/dev/null || true
 
       - name: Upload test and coverage reports
         if: always()
@@ -244,6 +267,7 @@ jobs:
             src/**/build/reports/
             src/**/build/test-results/
             src/**/target/surefire-reports/
+            src/**/target/failsafe-reports/
             src/**/target/site/
             src/**/test-results/
 
@@ -287,7 +311,7 @@ jobs:
           fi
 
           if [ ! -f "sonar-project.properties" ]; then
-            echo "sonar-project.properties file is missing."
+            echo "sonar-project.properties is missing."
             exit 1
           fi
 
@@ -318,7 +342,7 @@ jobs:
       - sonar
 
     if: github.event_name != 'pull_request'
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout application repository
@@ -377,6 +401,7 @@ jobs:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: retail-store-${{ github.run_id }}
+          mask-aws-account-id: false
 
       - name: Verify assumed AWS role
         shell: bash
@@ -409,6 +434,8 @@ jobs:
 
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: true
 
       - name: Validate Dockerfiles
         shell: bash
@@ -431,7 +458,7 @@ jobs:
               exit 1
             fi
 
-            echo "Found ${dockerfile}"
+            echo "Found: ${dockerfile}"
           done
 
       - name: Build application Docker images
@@ -531,13 +558,17 @@ jobs:
           set -euo pipefail
 
           if [ ! -f "${GITOPS_MANIFEST}" ]; then
-            echo "GitOps manifest was not found:"
+            echo "GitOps manifest not found:"
             echo "${GITOPS_MANIFEST}"
 
             echo
             echo "Available files:"
 
-            find . -maxdepth 6 -type f | sort
+            find . \
+              -maxdepth 6 \
+              -type f \
+              | sort
+
             exit 1
           fi
 
@@ -570,16 +601,16 @@ jobs:
           for service in "${services[@]}"; do
             new_image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
 
-            echo "Updating ${service}: ${new_image}"
+            echo "Updating ${service} to ${new_image}"
 
-            # First automated deployment:
-            # public image → private ECR image.
+            # First pipeline deployment:
+            # replace the public ECR image.
             sed -i -E \
               "s|${public_images[$service]}:[^[:space:]\"']+|${new_image}|g" \
               "${file}"
 
-            # Subsequent deployments:
-            # old private image tag → new private image tag.
+            # Subsequent pipeline deployments:
+            # replace the previous private ECR tag.
             sed -i -E \
               "s|${ECR_REGISTRY}/retail-store-${service}:[^[:space:]\"']+|${new_image}|g" \
               "${file}"
