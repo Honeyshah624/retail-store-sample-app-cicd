@@ -36,7 +36,7 @@ jobs:
   test:
     name: Unit Tests and Coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Checkout application repository
@@ -44,46 +44,49 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Display repository structure
-        shell: bash
-        run: |
-          echo "Repository root:"
-          pwd
-
-          echo
-          echo "Top-level files:"
-          find . -maxdepth 2 -type f | sort | head -200
-
-          echo
-          echo "Service directories:"
-          find src -maxdepth 2 -type f 2>/dev/null | sort | head -200
-
-      # Important:
-      # Do not add "cache: gradle" here.
+      # Do not add cache: gradle because this repository
+      # does not have Gradle files at repository root.
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
+      # Reads Go 1.25 or the toolchain version directly
+      # from src/catalog/go.mod.
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.24"
+          go-version-file: src/catalog/go.mod
+          cache: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Verify installed tools
+      - name: Verify installed tool versions
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "Java version:"
           java -version
+
+          echo
+          echo "Go version:"
           go version
+
+          echo
+          echo "Go requirement from catalog go.mod:"
+          grep -E '^(go|toolchain) ' src/catalog/go.mod || true
+
+          echo
+          echo "Node.js version:"
           node --version
+
+          echo
+          echo "npm version:"
           npm --version
 
       - name: Run available unit tests
@@ -95,31 +98,42 @@ jobs:
             ui
             catalog
             cart
-            carts
             orders
             checkout
           )
 
-          test_frameworks_found=0
+          detected_projects=0
 
           for service in "${services[@]}"; do
             directory="src/${service}"
 
+            echo
+            echo "====================================================="
+            echo "Service: ${service}"
+            echo "Directory: ${directory}"
+            echo "====================================================="
+
             if [ ! -d "${directory}" ]; then
-              echo "Skipping ${service}: ${directory} does not exist"
+              echo "Directory does not exist. Skipping ${service}."
               continue
             fi
 
-            echo
-            echo "=================================================="
-            echo "Checking tests for ${service}"
-            echo "Directory: ${directory}"
-            echo "=================================================="
+            # Maven
+            if [ -f "${directory}/pom.xml" ]; then
+              detected_projects=$((detected_projects + 1))
 
-            if [ -f "${directory}/gradlew" ]; then
-              test_frameworks_found=$((test_frameworks_found + 1))
+              echo "Maven project detected."
 
-              echo "Gradle wrapper detected"
+              (
+                cd "${directory}"
+                mvn --batch-mode --no-transfer-progress clean test
+              )
+
+            # Gradle wrapper
+            elif [ -f "${directory}/gradlew" ]; then
+              detected_projects=$((detected_projects + 1))
+
+              echo "Gradle project detected."
 
               chmod +x "${directory}/gradlew"
 
@@ -128,23 +142,16 @@ jobs:
                 ./gradlew clean test --no-daemon
               )
 
-            elif [ -f "${directory}/pom.xml" ]; then
-              test_frameworks_found=$((test_frameworks_found + 1))
-
-              echo "Maven project detected"
-
-              (
-                cd "${directory}"
-                mvn --batch-mode clean test
-              )
-
+            # Go
             elif [ -f "${directory}/go.mod" ]; then
-              test_frameworks_found=$((test_frameworks_found + 1))
+              detected_projects=$((detected_projects + 1))
 
-              echo "Go project detected"
+              echo "Go project detected."
 
               (
                 cd "${directory}"
+
+                go mod download
 
                 go test ./... \
                   -covermode=atomic \
@@ -153,54 +160,74 @@ jobs:
                 go tool cover -func=coverage.out
               )
 
+            # npm
             elif [ -f "${directory}/package-lock.json" ]; then
-              test_frameworks_found=$((test_frameworks_found + 1))
+              detected_projects=$((detected_projects + 1))
 
-              echo "Node.js npm project detected"
+              echo "npm project detected."
 
               (
                 cd "${directory}"
 
                 npm ci
-                npm test --if-present
+
+                if node -e \
+                  "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
+                  npm test -- --coverage
+                else
+                  echo "No test script configured. Skipping Node.js tests."
+                fi
               )
 
+            # Yarn
             elif [ -f "${directory}/yarn.lock" ]; then
-              test_frameworks_found=$((test_frameworks_found + 1))
+              detected_projects=$((detected_projects + 1))
 
-              echo "Node.js Yarn project detected"
+              echo "Yarn project detected."
 
               (
                 cd "${directory}"
 
                 corepack enable
                 yarn install --immutable
-                yarn test --if-present
+
+                if node -e \
+                  "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
+                  yarn test --coverage
+                else
+                  echo "No test script configured. Skipping Yarn tests."
+                fi
               )
 
+            # package.json without lock file
             elif [ -f "${directory}/package.json" ]; then
-              test_frameworks_found=$((test_frameworks_found + 1))
+              detected_projects=$((detected_projects + 1))
 
-              echo "Node.js project detected without lock file"
+              echo "Node.js project without a lock file detected."
 
               (
                 cd "${directory}"
 
                 npm install
-                npm test --if-present
+
+                if node -e \
+                  "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
+                  npm test -- --coverage
+                else
+                  echo "No test script configured. Skipping Node.js tests."
+                fi
               )
 
             else
-              echo "No supported unit-test configuration found for ${service}"
+              echo "No supported test configuration found for ${service}."
             fi
           done
 
           echo
-          echo "Detected testable projects: ${test_frameworks_found}"
+          echo "Detected projects: ${detected_projects}"
 
-          if [ "${test_frameworks_found}" -eq 0 ]; then
-            echo "No Gradle, Maven, Go or Node.js project configuration was found."
-            echo "Review the repository structure printed earlier."
+          if [ "${detected_projects}" -eq 0 ]; then
+            echo "No Maven, Gradle, Go or Node.js projects were detected."
             exit 1
           fi
 
@@ -215,12 +242,13 @@ jobs:
             src/**/coverage.out
             src/**/coverage/
             src/**/build/reports/
+            src/**/build/test-results/
             src/**/target/surefire-reports/
             src/**/target/site/
             src/**/test-results/
 
   # =========================================================
-  # 2. SONARQUBE ANALYSIS AND QUALITY GATE
+  # 2. SONARQUBE SCAN AND QUALITY GATE
   # =========================================================
   sonar:
     name: SonarQube Scan and Quality Gate
@@ -248,23 +276,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${SONAR_TOKEN}" ]; then
-            echo "SONAR_TOKEN secret is missing"
+          if [ -z "${SONAR_TOKEN:-}" ]; then
+            echo "SONAR_TOKEN secret is missing."
             exit 1
           fi
 
-          if [ -z "${SONAR_HOST_URL}" ]; then
-            echo "SONAR_HOST_URL secret is missing"
+          if [ -z "${SONAR_HOST_URL:-}" ]; then
+            echo "SONAR_HOST_URL secret is missing."
             exit 1
           fi
 
-          if [ ! -f sonar-project.properties ]; then
-            echo "sonar-project.properties does not exist"
+          if [ ! -f "sonar-project.properties" ]; then
+            echo "sonar-project.properties file is missing."
             exit 1
           fi
 
-          echo "SonarQube configuration is present."
-          echo "SonarQube host: ${SONAR_HOST_URL}"
+          echo "SonarQube configuration is available."
 
       - name: Run SonarQube scan
         uses: SonarSource/sonarqube-scan-action@v6
@@ -280,12 +307,12 @@ jobs:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
   # =========================================================
-  # 3. BUILD, TRIVY, ECR AND GITOPS
-  # Runs only for main push/manual run, not pull requests.
+  # 3. BUILD, TRIVY, ECR PUSH AND GITOPS UPDATE
   # =========================================================
   build-scan-push:
     name: Build, Scan, Push and Update GitOps
     runs-on: ubuntu-latest
+
     needs:
       - test
       - sonar
@@ -313,12 +340,26 @@ jobs:
 
           for variable in "${required_variables[@]}"; do
             if [ -z "${!variable:-}" ]; then
-              echo "Missing GitHub Actions variable: ${variable}"
+              echo "Missing GitHub variable: ${variable}"
               exit 1
             fi
           done
 
-          echo "All required variables are configured."
+          echo "All required GitHub variables are configured."
+
+      - name: Validate GitOps token
+        shell: bash
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GITOPS_TOKEN:-}" ]; then
+            echo "GITOPS_TOKEN secret is missing."
+            exit 1
+          fi
+
+          echo "GITOPS_TOKEN is configured."
 
       - name: Generate immutable image tag
         shell: bash
@@ -369,7 +410,7 @@ jobs:
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Detect Docker build contexts
+      - name: Validate Dockerfiles
         shell: bash
         run: |
           set -euo pipefail
@@ -383,13 +424,14 @@ jobs:
           )
 
           for service in "${services[@]}"; do
-            if [ ! -f "src/${service}/Dockerfile" ]; then
-              echo "Dockerfile missing for service: ${service}"
-              echo "Expected: src/${service}/Dockerfile"
+            dockerfile="src/${service}/Dockerfile"
+
+            if [ ! -f "${dockerfile}" ]; then
+              echo "Dockerfile missing: ${dockerfile}"
               exit 1
             fi
 
-            echo "Found: src/${service}/Dockerfile"
+            echo "Found ${dockerfile}"
           done
 
       - name: Build application Docker images
@@ -489,12 +531,13 @@ jobs:
           set -euo pipefail
 
           if [ ! -f "${GITOPS_MANIFEST}" ]; then
-            echo "GitOps manifest not found: ${GITOPS_MANIFEST}"
+            echo "GitOps manifest was not found:"
+            echo "${GITOPS_MANIFEST}"
 
             echo
-            echo "Files available in the GitOps repository:"
+            echo "Available files:"
 
-            find . -maxdepth 5 -type f | sort
+            find . -maxdepth 6 -type f | sort
             exit 1
           fi
 
@@ -527,20 +570,22 @@ jobs:
           for service in "${services[@]}"; do
             new_image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
 
-            echo "Updating ${service} to ${new_image}"
+            echo "Updating ${service}: ${new_image}"
 
-            # First deployment: replace the public AWS sample image.
+            # First automated deployment:
+            # public image → private ECR image.
             sed -i -E \
               "s|${public_images[$service]}:[^[:space:]\"']+|${new_image}|g" \
               "${file}"
 
-            # Future deployments: replace the previous private ECR tag.
+            # Subsequent deployments:
+            # old private image tag → new private image tag.
             sed -i -E \
               "s|${ECR_REGISTRY}/retail-store-${service}:[^[:space:]\"']+|${new_image}|g" \
               "${file}"
           done
 
-      - name: Verify all GitOps image updates
+      - name: Verify GitOps image updates
         working-directory: gitops
         shell: bash
         run: |
@@ -557,17 +602,17 @@ jobs:
           )
 
           for service in "${services[@]}"; do
-            expected="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
+            expected_image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
 
-            if ! grep -Fq "${expected}" "${file}"; then
-              echo "Failed to update image for ${service}"
-              echo "Expected: ${expected}"
+            if ! grep -Fq "${expected_image}" "${file}"; then
+              echo "Image update failed for service: ${service}"
+              echo "Expected image: ${expected_image}"
               exit 1
             fi
           done
 
           echo
-          echo "Updated private ECR image references:"
+          echo "Updated application images:"
 
           grep -nF \
             "${ECR_REGISTRY}/retail-store-" \
@@ -586,7 +631,7 @@ jobs:
           git add "${GITOPS_MANIFEST}"
 
           if git diff --cached --quiet; then
-            echo "No GitOps manifest changes were detected."
+            echo "No GitOps changes detected."
             exit 0
           fi
 
@@ -605,11 +650,11 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## Retail Store CI/CD"
+            echo "## Retail Store CI/CD Deployment"
             echo
             echo "- Image tag: \`${IMAGE_TAG}\`"
             echo "- ECR registry: \`${ECR_REGISTRY}\`"
             echo "- GitOps repository: \`${GITOPS_REPOSITORY}\`"
-            echo "- Manifest: \`${GITOPS_MANIFEST}\`"
-            echo "- Argo CD will detect and deploy the GitOps commit."
+            echo "- GitOps manifest: \`${GITOPS_MANIFEST}\`"
+            echo "- Argo CD will automatically deploy the GitOps commit."
           } >> "${GITHUB_STEP_SUMMARY}"
