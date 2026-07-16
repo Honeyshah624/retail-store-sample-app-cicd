@@ -1,0 +1,153 @@
+name: Retail Store CI CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+  GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
+  GITOPS_BRANCH: ${{ vars.GITOPS_BRANCH }}
+  GITOPS_MANIFEST: ${{ vars.GITOPS_MANIFEST }}
+
+jobs:
+  build-scan-push-deploy:
+    name: Build, Scan, Push and GitOps Update
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout application repository
+        uses: actions/checkout@v4
+
+      - name: Generate image tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "Image tag: ${IMAGE_TAG}"
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: retail-store-${{ github.run_id }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build application images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for service in ui catalog cart orders checkout
+          do
+            IMAGE="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
+
+            echo "Building ${IMAGE}"
+
+            docker build \
+              --pull \
+              --tag "${IMAGE}" \
+              "src/${service}"
+          done
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.4
+        with:
+          version: latest
+          cache: true
+
+      - name: Scan application images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for service in ui catalog cart orders checkout
+          do
+            IMAGE="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
+
+            trivy image \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 0 \
+              "${IMAGE}"
+          done
+
+      - name: Push images to Amazon ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for service in ui catalog cart orders checkout
+          do
+            IMAGE="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
+
+            echo "Pushing ${IMAGE}"
+            docker push "${IMAGE}"
+          done
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: ${{ env.GITOPS_BRANCH }}
+          path: gitops
+
+      - name: Update GitOps image references
+        working-directory: gitops
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="${GITOPS_MANIFEST}"
+
+          if [ ! -f "${FILE}" ]; then
+            echo "Manifest not found: ${FILE}"
+            exit 1
+          fi
+
+          for service in ui catalog cart orders checkout
+          do
+            sed -i -E \
+              "s|${ECR_REGISTRY}/retail-store-${service}:[^[:space:]\"']+|${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}|g" \
+              "${FILE}"
+          done
+
+          grep -n "${ECR_REGISTRY}/retail-store-" "${FILE}"
+
+      - name: Commit and push GitOps change
+        working-directory: gitops
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${GITOPS_MANIFEST}"
+
+          if git diff --cached --quiet; then
+            echo "No manifest changes detected"
+            exit 0
+          fi
+
+          git commit -m "Deploy retail store ${IMAGE_TAG}"
+          git push origin "${GITOPS_BRANCH}"
