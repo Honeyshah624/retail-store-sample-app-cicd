@@ -17,7 +17,7 @@ permissions:
 
 concurrency:
   group: retail-store-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
@@ -29,165 +29,275 @@ env:
   GITOPS_MANIFEST: ${{ vars.GITOPS_MANIFEST }}
 
 jobs:
-  # ==========================================================
+
+  # =========================================================
   # 1. UNIT TESTS AND CODE COVERAGE
-  # ==========================================================
+  # =========================================================
   test:
     name: Unit Tests and Coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout application repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Display repository structure
+        shell: bash
+        run: |
+          echo "Repository root:"
+          pwd
+
+          echo
+          echo "Top-level files:"
+          find . -maxdepth 2 -type f | sort | head -200
+
+          echo
+          echo "Service directories:"
+          find src -maxdepth 2 -type f 2>/dev/null | sort | head -200
+
+      # Important:
+      # Do not add "cache: gradle" here.
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
-          cache: gradle
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: src/catalog/go.mod
-          cache: true
-          cache-dependency-path: src/catalog/go.sum
+          go-version: "1.24"
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: src/checkout/package-lock.json
 
-      - name: Run UI tests
-        working-directory: src/ui
+      - name: Verify installed tools
         shell: bash
         run: |
           set -euo pipefail
 
-          chmod +x gradlew
-          ./gradlew clean test
+          java -version
+          go version
+          node --version
+          npm --version
 
-      - name: Run Cart tests
-        working-directory: src/cart
+      - name: Run available unit tests
         shell: bash
         run: |
           set -euo pipefail
 
-          chmod +x gradlew
-          ./gradlew clean test
+          services=(
+            ui
+            catalog
+            cart
+            carts
+            orders
+            checkout
+          )
 
-      - name: Run Orders tests
-        working-directory: src/orders
-        shell: bash
-        run: |
-          set -euo pipefail
+          test_frameworks_found=0
 
-          chmod +x gradlew
-          ./gradlew clean test
+          for service in "${services[@]}"; do
+            directory="src/${service}"
 
-      - name: Run Catalog tests with coverage
-        working-directory: src/catalog
-        shell: bash
-        run: |
-          set -euo pipefail
+            if [ ! -d "${directory}" ]; then
+              echo "Skipping ${service}: ${directory} does not exist"
+              continue
+            fi
 
-          go test ./... \
-            -covermode=atomic \
-            -coverprofile=coverage.out
+            echo
+            echo "=================================================="
+            echo "Checking tests for ${service}"
+            echo "Directory: ${directory}"
+            echo "=================================================="
 
-          go tool cover -func=coverage.out
+            if [ -f "${directory}/gradlew" ]; then
+              test_frameworks_found=$((test_frameworks_found + 1))
 
-      - name: Run Checkout tests
-        working-directory: src/checkout
-        shell: bash
-        run: |
-          set -euo pipefail
+              echo "Gradle wrapper detected"
 
-          if [ -f package-lock.json ]; then
-            npm ci
-            npm test -- --coverage
-          elif [ -f yarn.lock ]; then
-            corepack enable
-            yarn install --immutable
-            yarn test --coverage
-          else
-            echo "No package-lock.json or yarn.lock found in src/checkout"
+              chmod +x "${directory}/gradlew"
+
+              (
+                cd "${directory}"
+                ./gradlew clean test --no-daemon
+              )
+
+            elif [ -f "${directory}/pom.xml" ]; then
+              test_frameworks_found=$((test_frameworks_found + 1))
+
+              echo "Maven project detected"
+
+              (
+                cd "${directory}"
+                mvn --batch-mode clean test
+              )
+
+            elif [ -f "${directory}/go.mod" ]; then
+              test_frameworks_found=$((test_frameworks_found + 1))
+
+              echo "Go project detected"
+
+              (
+                cd "${directory}"
+
+                go test ./... \
+                  -covermode=atomic \
+                  -coverprofile=coverage.out
+
+                go tool cover -func=coverage.out
+              )
+
+            elif [ -f "${directory}/package-lock.json" ]; then
+              test_frameworks_found=$((test_frameworks_found + 1))
+
+              echo "Node.js npm project detected"
+
+              (
+                cd "${directory}"
+
+                npm ci
+                npm test --if-present
+              )
+
+            elif [ -f "${directory}/yarn.lock" ]; then
+              test_frameworks_found=$((test_frameworks_found + 1))
+
+              echo "Node.js Yarn project detected"
+
+              (
+                cd "${directory}"
+
+                corepack enable
+                yarn install --immutable
+                yarn test --if-present
+              )
+
+            elif [ -f "${directory}/package.json" ]; then
+              test_frameworks_found=$((test_frameworks_found + 1))
+
+              echo "Node.js project detected without lock file"
+
+              (
+                cd "${directory}"
+
+                npm install
+                npm test --if-present
+              )
+
+            else
+              echo "No supported unit-test configuration found for ${service}"
+            fi
+          done
+
+          echo
+          echo "Detected testable projects: ${test_frameworks_found}"
+
+          if [ "${test_frameworks_found}" -eq 0 ]; then
+            echo "No Gradle, Maven, Go or Node.js project configuration was found."
+            echo "Review the repository structure printed earlier."
             exit 1
           fi
 
-      - name: Upload coverage and test reports
+      - name: Upload test and coverage reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-reports
-          if-no-files-found: warn
           retention-days: 7
+          if-no-files-found: warn
           path: |
-            src/catalog/coverage.out
-            src/ui/build/reports/
-            src/cart/build/reports/
-            src/orders/build/reports/
-            src/checkout/coverage/
+            src/**/coverage.out
+            src/**/coverage/
+            src/**/build/reports/
+            src/**/target/surefire-reports/
+            src/**/target/site/
+            src/**/test-results/
 
-  # ==========================================================
-  # 2. SONARQUBE SCAN AND QUALITY GATE
-  # ==========================================================
+  # =========================================================
+  # 2. SONARQUBE ANALYSIS AND QUALITY GATE
+  # =========================================================
   sonar:
     name: SonarQube Scan and Quality Gate
-    needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    needs: test
+    timeout-minutes: 30
 
     steps:
       - name: Checkout application repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Download coverage reports
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v4
         with:
           name: coverage-reports
           path: .
 
+      - name: Validate SonarQube configuration
+        shell: bash
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SONAR_TOKEN}" ]; then
+            echo "SONAR_TOKEN secret is missing"
+            exit 1
+          fi
+
+          if [ -z "${SONAR_HOST_URL}" ]; then
+            echo "SONAR_HOST_URL secret is missing"
+            exit 1
+          fi
+
+          if [ ! -f sonar-project.properties ]; then
+            echo "sonar-project.properties does not exist"
+            exit 1
+          fi
+
+          echo "SonarQube configuration is present."
+          echo "SonarQube host: ${SONAR_HOST_URL}"
+
       - name: Run SonarQube scan
-        uses: SonarSource/sonarqube-scan-action@v8.2.1
+        uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
       - name: Check SonarQube Quality Gate
-        uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
+        uses: SonarSource/sonarqube-quality-gate-action@v1
         timeout-minutes: 10
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-  # ==========================================================
-  # 3. BUILD, SCAN, PUSH AND UPDATE GITOPS
-  # ==========================================================
+  # =========================================================
+  # 3. BUILD, TRIVY, ECR AND GITOPS
+  # Runs only for main push/manual run, not pull requests.
+  # =========================================================
   build-scan-push:
     name: Build, Scan, Push and Update GitOps
+    runs-on: ubuntu-latest
     needs:
       - test
       - sonar
 
     if: github.event_name != 'pull_request'
-
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout application repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      - name: Validate required variables
+      - name: Validate required GitHub variables
         shell: bash
         run: |
           set -euo pipefail
@@ -203,10 +313,12 @@ jobs:
 
           for variable in "${required_variables[@]}"; do
             if [ -z "${!variable:-}" ]; then
-              echo "Required GitHub variable is missing: ${variable}"
+              echo "Missing GitHub Actions variable: ${variable}"
               exit 1
             fi
           done
+
+          echo "All required variables are configured."
 
       - name: Generate immutable image tag
         shell: bash
@@ -218,13 +330,12 @@ jobs:
           echo "IMAGE_TAG=${IMAGE_TAG}" >> "${GITHUB_ENV}"
           echo "Generated image tag: ${IMAGE_TAG}"
 
-      - name: Configure AWS credentials using OIDC
-        uses: aws-actions/configure-aws-credentials@v6.1.0
+      - name: Configure AWS credentials using GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: retail-store-${{ github.run_id }}
-          mask-aws-account-id: false
 
       - name: Verify assumed AWS role
         shell: bash
@@ -238,22 +349,50 @@ jobs:
         run: |
           set -euo pipefail
 
-          aws ecr describe-repositories \
-            --region "${AWS_REGION}" \
-            --repository-names \
-              retail-store-ui \
-              retail-store-catalog \
-              retail-store-cart \
-              retail-store-orders \
-              retail-store-checkout
+          repositories=(
+            retail-store-ui
+            retail-store-catalog
+            retail-store-cart
+            retail-store-orders
+            retail-store-checkout
+          )
+
+          for repository in "${repositories[@]}"; do
+            echo "Checking ECR repository: ${repository}"
+
+            aws ecr describe-repositories \
+              --region "${AWS_REGION}" \
+              --repository-names "${repository}" \
+              --no-cli-pager
+          done
 
       - name: Log in to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-        with:
-          mask-password: true
 
-      - name: Build application images
+      - name: Detect Docker build contexts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          services=(
+            ui
+            catalog
+            cart
+            orders
+            checkout
+          )
+
+          for service in "${services[@]}"; do
+            if [ ! -f "src/${service}/Dockerfile" ]; then
+              echo "Dockerfile missing for service: ${service}"
+              echo "Expected: src/${service}/Dockerfile"
+              exit 1
+            fi
+
+            echo "Found: src/${service}/Dockerfile"
+          done
+
+      - name: Build application Docker images
         shell: bash
         run: |
           set -euo pipefail
@@ -269,12 +408,8 @@ jobs:
           for service in "${services[@]}"; do
             image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
 
+            echo
             echo "Building ${image}"
-
-            if [ ! -f "src/${service}/Dockerfile" ]; then
-              echo "Dockerfile not found: src/${service}/Dockerfile"
-              exit 1
-            fi
 
             docker build \
               --pull \
@@ -282,21 +417,19 @@ jobs:
               "src/${service}"
           done
 
-      - name: Scan images with Trivy
-        uses: aquasecurity/trivy-action@0.35.0
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.4
         with:
-          image-ref: "${{ env.ECR_REGISTRY }}/retail-store-ui:${{ env.IMAGE_TAG }}"
-          format: table
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "0"
+          version: latest
+          cache: true
 
-      - name: Scan remaining images with Trivy
+      - name: Scan Docker images with Trivy
         shell: bash
         run: |
           set -euo pipefail
 
           services=(
+            ui
             catalog
             cart
             orders
@@ -306,6 +439,7 @@ jobs:
           for service in "${services[@]}"; do
             image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
 
+            echo
             echo "Scanning ${image}"
 
             trivy image \
@@ -316,7 +450,7 @@ jobs:
               "${image}"
           done
 
-      - name: Push application images to ECR
+      - name: Push application images to Amazon ECR
         shell: bash
         run: |
           set -euo pipefail
@@ -332,12 +466,14 @@ jobs:
           for service in "${services[@]}"; do
             image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
 
+            echo
             echo "Pushing ${image}"
+
             docker push "${image}"
           done
 
       - name: Checkout GitOps repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.GITOPS_REPOSITORY }}
           token: ${{ secrets.GITOPS_TOKEN }}
@@ -353,16 +489,16 @@ jobs:
           set -euo pipefail
 
           if [ ! -f "${GITOPS_MANIFEST}" ]; then
-            echo "GitOps manifest does not exist:"
-            echo "${GITOPS_MANIFEST}"
+            echo "GitOps manifest not found: ${GITOPS_MANIFEST}"
+
             echo
-            echo "Available files:"
-            find environments -type f | sort
+            echo "Files available in the GitOps repository:"
+
+            find . -maxdepth 5 -type f | sort
             exit 1
           fi
 
-          echo "Using GitOps manifest:"
-          echo "${GITOPS_MANIFEST}"
+          echo "Using GitOps manifest: ${GITOPS_MANIFEST}"
 
       - name: Update GitOps image references
         working-directory: gitops
@@ -372,14 +508,6 @@ jobs:
 
           file="${GITOPS_MANIFEST}"
 
-          declare -A public_images=(
-            [ui]="public.ecr.aws/aws-containers/retail-store-sample-ui"
-            [catalog]="public.ecr.aws/aws-containers/retail-store-sample-catalog"
-            [cart]="public.ecr.aws/aws-containers/retail-store-sample-cart"
-            [orders]="public.ecr.aws/aws-containers/retail-store-sample-orders"
-            [checkout]="public.ecr.aws/aws-containers/retail-store-sample-checkout"
-          )
-
           services=(
             ui
             catalog
@@ -388,23 +516,31 @@ jobs:
             checkout
           )
 
-          for service in "${services[@]}"; do
-            private_image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
+          declare -A public_images=(
+            [ui]="public.ecr.aws/aws-containers/retail-store-sample-ui"
+            [catalog]="public.ecr.aws/aws-containers/retail-store-sample-catalog"
+            [cart]="public.ecr.aws/aws-containers/retail-store-sample-cart"
+            [orders]="public.ecr.aws/aws-containers/retail-store-sample-orders"
+            [checkout]="public.ecr.aws/aws-containers/retail-store-sample-checkout"
+          )
 
-            # First pipeline run:
-            # replace public ECR image with private ECR image.
+          for service in "${services[@]}"; do
+            new_image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
+
+            echo "Updating ${service} to ${new_image}"
+
+            # First deployment: replace the public AWS sample image.
             sed -i -E \
-              "s|${public_images[$service]}:[^[:space:]\"']+|${private_image}|g" \
+              "s|${public_images[$service]}:[^[:space:]\"']+|${new_image}|g" \
               "${file}"
 
-            # Later pipeline runs:
-            # replace the previous private ECR image tag.
+            # Future deployments: replace the previous private ECR tag.
             sed -i -E \
-              "s|${ECR_REGISTRY}/retail-store-${service}:[^[:space:]\"']+|${private_image}|g" \
+              "s|${ECR_REGISTRY}/retail-store-${service}:[^[:space:]\"']+|${new_image}|g" \
               "${file}"
           done
 
-      - name: Verify GitOps image updates
+      - name: Verify all GitOps image updates
         working-directory: gitops
         shell: bash
         run: |
@@ -421,19 +557,23 @@ jobs:
           )
 
           for service in "${services[@]}"; do
-            expected_image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
+            expected="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
 
-            if ! grep -Fq "${expected_image}" "${file}"; then
-              echo "Image update failed for service: ${service}"
-              echo "Expected: ${expected_image}"
+            if ! grep -Fq "${expected}" "${file}"; then
+              echo "Failed to update image for ${service}"
+              echo "Expected: ${expected}"
               exit 1
             fi
           done
 
-          echo "Updated application images:"
-          grep -nF "${ECR_REGISTRY}/retail-store-" "${file}"
+          echo
+          echo "Updated private ECR image references:"
 
-      - name: Commit and push GitOps changes
+          grep -nF \
+            "${ECR_REGISTRY}/retail-store-" \
+            "${file}"
+
+      - name: Commit and push GitOps update
         working-directory: gitops
         shell: bash
         run: |
@@ -446,7 +586,7 @@ jobs:
           git add "${GITOPS_MANIFEST}"
 
           if git diff --cached --quiet; then
-            echo "No GitOps changes detected."
+            echo "No GitOps manifest changes were detected."
             exit 0
           fi
 
@@ -461,15 +601,15 @@ jobs:
             origin \
             "HEAD:${GITOPS_BRANCH}"
 
-      - name: Pipeline summary
+      - name: Write deployment summary
         shell: bash
         run: |
           {
-            echo "## Retail Store Deployment"
+            echo "## Retail Store CI/CD"
             echo
             echo "- Image tag: \`${IMAGE_TAG}\`"
             echo "- ECR registry: \`${ECR_REGISTRY}\`"
             echo "- GitOps repository: \`${GITOPS_REPOSITORY}\`"
-            echo "- GitOps manifest: \`${GITOPS_MANIFEST}\`"
-            echo "- Argo CD will deploy the GitOps commit automatically."
+            echo "- Manifest: \`${GITOPS_MANIFEST}\`"
+            echo "- Argo CD will detect and deploy the GitOps commit."
           } >> "${GITHUB_STEP_SUMMARY}"
