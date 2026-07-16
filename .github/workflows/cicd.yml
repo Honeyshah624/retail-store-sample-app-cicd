@@ -23,29 +23,27 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
   ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+
   GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
   GITOPS_BRANCH: ${{ vars.GITOPS_BRANCH }}
   GITOPS_MANIFEST: ${{ vars.GITOPS_MANIFEST }}
 
 jobs:
-
   # =========================================================
-  # 1. UNIT TESTS AND COVERAGE
+  # 1. TESTS, COVERAGE, SONARQUBE AND QUALITY GATE
   # =========================================================
-  test:
-    name: Unit Tests and Coverage
+  quality:
+    name: Tests, Coverage and SonarQube
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
 
-    # Dummy credentials are required by the AWS SDK used in the
-    # DynamoDB Testcontainers integration tests.
-    # They do not provide access to your AWS account.
+    # Dummy AWS values are used only by local DynamoDB
+    # Testcontainers integration tests.
     env:
       AWS_REGION: us-east-1
       AWS_DEFAULT_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
-      AWS_SESSION_TOKEN: test
       AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
@@ -60,7 +58,7 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Set up Go from go.mod
+      - name: Set up Go from catalog go.mod
         uses: actions/setup-go@v6
         with:
           go-version-file: src/catalog/go.mod
@@ -71,7 +69,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Verify installed tools
+      - name: Verify tools and Docker
         shell: bash
         run: |
           set -euo pipefail
@@ -79,154 +77,119 @@ jobs:
           echo "===== Java ====="
           java -version
 
+          echo
           echo "===== Maven ====="
           mvn --version
 
+          echo
           echo "===== Go ====="
           go version
           grep -E '^(go|toolchain) ' src/catalog/go.mod || true
 
+          echo
           echo "===== Node.js ====="
           node --version
           npm --version
 
+          echo
           echo "===== Docker ====="
           docker version
           docker info
 
-      - name: Run service unit and integration tests
+      - name: Run Maven tests
         shell: bash
         run: |
           set -euo pipefail
 
-          services=(
+          maven_services=(
             ui
-            catalog
             cart
             orders
-            checkout
           )
 
-          detected_projects=0
-
-          for service in "${services[@]}"; do
+          for service in "${maven_services[@]}"; do
             directory="src/${service}"
 
             echo
             echo "===================================================="
-            echo "Testing service: ${service}"
-            echo "Directory: ${directory}"
+            echo "Testing Maven service: ${service}"
             echo "===================================================="
 
-            if [ ! -d "${directory}" ]; then
-              echo "Directory not found. Skipping ${service}."
-              continue
+            if [ ! -f "${directory}/pom.xml" ]; then
+              echo "pom.xml not found: ${directory}/pom.xml"
+              exit 1
             fi
 
-            if [ -f "${directory}/pom.xml" ]; then
-              detected_projects=$((detected_projects + 1))
+            (
+              cd "${directory}"
 
-              echo "Maven project detected."
-
-              (
-                cd "${directory}"
-
-                mvn \
-                  --batch-mode \
-                  --no-transfer-progress \
-                  clean test
-              )
-
-            elif [ -f "${directory}/gradlew" ]; then
-              detected_projects=$((detected_projects + 1))
-
-              echo "Gradle project detected."
-
-              chmod +x "${directory}/gradlew"
-
-              (
-                cd "${directory}"
-
-                ./gradlew \
-                  clean test \
-                  --no-daemon
-              )
-
-            elif [ -f "${directory}/go.mod" ]; then
-              detected_projects=$((detected_projects + 1))
-
-              echo "Go project detected."
-
-              (
-                cd "${directory}"
-
-                go mod download
-
-                go test ./... \
-                  -covermode=atomic \
-                  -coverprofile=coverage.out
-
-                go tool cover \
-                  -func=coverage.out
-              )
-
-            elif [ -f "${directory}/package-lock.json" ]; then
-              detected_projects=$((detected_projects + 1))
-
-              echo "npm project detected."
-
-              (
-                cd "${directory}"
-
-                npm ci
-                npm test --if-present
-              )
-
-            elif [ -f "${directory}/yarn.lock" ]; then
-              detected_projects=$((detected_projects + 1))
-
-              echo "Yarn project detected."
-
-              (
-                cd "${directory}"
-
-                corepack enable
-                yarn install --immutable
-
-                if node -e \
-                  "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
-                  yarn test
-                else
-                  echo "No Yarn test script configured."
-                fi
-              )
-
-            elif [ -f "${directory}/package.json" ]; then
-              detected_projects=$((detected_projects + 1))
-
-              echo "Node.js project without lock file detected."
-
-              (
-                cd "${directory}"
-
-                npm install
-                npm test --if-present
-              )
-
-            else
-              echo "No supported build configuration found."
-            fi
+              mvn \
+                --batch-mode \
+                --no-transfer-progress \
+                clean test
+            )
           done
 
-          echo
-          echo "Detected testable projects: ${detected_projects}"
+      - name: Run Catalog Go tests and coverage
+        working-directory: src/catalog
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          if [ "${detected_projects}" -eq 0 ]; then
-            echo "No Maven, Gradle, Go or Node.js projects detected."
+          go mod download
+
+          go test ./... \
+            -covermode=atomic \
+            -coverprofile=coverage.out
+
+          go tool cover \
+            -func=coverage.out
+
+      - name: Run Checkout Node.js tests
+        working-directory: src/checkout
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          set -euo pipefail
+
+          if [ -f package-lock.json ]; then
+            npm ci
+
+            if node -e \
+              "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
+              npm test -- --coverage
+            else
+              echo "No npm test script configured."
+            fi
+
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --immutable
+
+            if node -e \
+              "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
+              yarn test --coverage
+            else
+              echo "No Yarn test script configured."
+            fi
+
+          elif [ -f package.json ]; then
+            npm install
+
+            if node -e \
+              "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
+              npm test -- --coverage
+            else
+              echo "No Node.js test script configured."
+            fi
+
+          else
+            echo "No package.json found in src/checkout."
             exit 1
           fi
 
-      - name: Show Maven failure details
+      - name: Show test failure details
         if: failure()
         shell: bash
         run: |
@@ -242,57 +205,18 @@ jobs:
               cat "$1"
             ' _ {} \; || true
 
-          echo "===== Maven XML reports ====="
-
-          find src \
-            -path "*/target/surefire-reports/*.xml" \
-            -type f \
-            -print || true
-
-          echo "===== Running Docker containers ====="
+          echo
+          echo "===== Docker containers ====="
 
           docker ps -a || true
-          docker logs $(docker ps -aq | head -1) 2>/dev/null || true
 
-      - name: Upload test and coverage reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-reports
-          retention-days: 7
-          if-no-files-found: warn
-          path: |
-            src/**/coverage.out
-            src/**/coverage/
-            src/**/build/reports/
-            src/**/build/test-results/
-            src/**/target/surefire-reports/
-            src/**/target/failsafe-reports/
-            src/**/target/site/
-            src/**/test-results/
+          for container in $(docker ps -aq); do
+            echo
+            echo "===== Logs for container ${container} ====="
+            docker logs "${container}" 2>&1 || true
+          done
 
-  # =========================================================
-  # 2. SONARQUBE SCAN AND QUALITY GATE
-  # =========================================================
-  sonar:
-    name: SonarQube Scan and Quality Gate
-    runs-on: ubuntu-latest
-    needs: test
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout application repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download coverage reports
-        uses: actions/download-artifact@v4
-        with:
-          name: coverage-reports
-          path: .
-
-      - name: Validate SonarQube configuration
+      - name: Validate SonarQube secrets
         shell: bash
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -310,12 +234,34 @@ jobs:
             exit 1
           fi
 
-          if [ ! -f "sonar-project.properties" ]; then
+          if [ ! -f sonar-project.properties ]; then
             echo "sonar-project.properties is missing."
             exit 1
           fi
 
-          echo "SonarQube configuration is available."
+          echo "SonarQube secrets and configuration are present."
+
+      - name: Test SonarQube connectivity
+        shell: bash
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          set -euo pipefail
+
+          sonar_url="${SONAR_HOST_URL%/}"
+
+          echo "Testing SonarQube connectivity..."
+
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --connect-timeout 20 \
+            --max-time 45 \
+            "${sonar_url}/api/system/status"
+
+          echo
+          echo "SonarQube is reachable."
 
       - name: Run SonarQube scan
         uses: SonarSource/sonarqube-scan-action@v6
@@ -325,24 +271,40 @@ jobs:
 
       - name: Check SonarQube Quality Gate
         uses: SonarSource/sonarqube-quality-gate-action@v1
-        timeout-minutes: 10
+        timeout-minutes: 15
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
+      - name: Upload test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-and-coverage-reports
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            src/**/coverage.out
+            src/**/coverage/
+            src/**/build/reports/
+            src/**/build/test-results/
+            src/**/target/classes/
+            src/**/target/surefire-reports/
+            src/**/target/failsafe-reports/
+            src/**/target/site/
+            src/**/test-results/
+            .scannerwork/report-task.txt
+
   # =========================================================
-  # 3. BUILD, TRIVY, ECR PUSH AND GITOPS UPDATE
+  # 2. BUILD, TRIVY, ECR AND GITOPS
   # =========================================================
   build-scan-push:
     name: Build, Scan, Push and Update GitOps
     runs-on: ubuntu-latest
-
-    needs:
-      - test
-      - sonar
+    needs: quality
+    timeout-minutes: 120
 
     if: github.event_name != 'pull_request'
-    timeout-minutes: 120
 
     steps:
       - name: Checkout application repository
@@ -369,7 +331,7 @@ jobs:
             fi
           done
 
-          echo "All required GitHub variables are configured."
+          echo "Required variables are configured."
 
       - name: Validate GitOps token
         shell: bash
@@ -396,7 +358,7 @@ jobs:
           echo "Generated image tag: ${IMAGE_TAG}"
 
       - name: Configure AWS credentials using GitHub OIDC
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -424,7 +386,7 @@ jobs:
           )
 
           for repository in "${repositories[@]}"; do
-            echo "Checking ECR repository: ${repository}"
+            echo "Checking repository: ${repository}"
 
             aws ecr describe-repositories \
               --region "${AWS_REGION}" \
@@ -458,7 +420,7 @@ jobs:
               exit 1
             fi
 
-            echo "Found: ${dockerfile}"
+            echo "Found ${dockerfile}"
           done
 
       - name: Build application Docker images
@@ -486,40 +448,53 @@ jobs:
               "src/${service}"
           done
 
-      - name: Install Trivy
-        uses: aquasecurity/setup-trivy@v0.2.4
+      # Version 0.35.0 is an immutable known-safe Trivy action release.
+      - name: Scan UI image with Trivy
+        uses: aquasecurity/trivy-action@0.35.0
         with:
-          version: latest
-          cache: true
+          image-ref: ${{ env.ECR_REGISTRY }}/retail-store-ui:${{ env.IMAGE_TAG }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
 
-      - name: Scan Docker images with Trivy
-        shell: bash
-        run: |
-          set -euo pipefail
+      - name: Scan Catalog image with Trivy
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/retail-store-catalog:${{ env.IMAGE_TAG }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
 
-          services=(
-            ui
-            catalog
-            cart
-            orders
-            checkout
-          )
+      - name: Scan Cart image with Trivy
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/retail-store-cart:${{ env.IMAGE_TAG }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
 
-          for service in "${services[@]}"; do
-            image="${ECR_REGISTRY}/retail-store-${service}:${IMAGE_TAG}"
+      - name: Scan Orders image with Trivy
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/retail-store-orders:${{ env.IMAGE_TAG }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
 
-            echo
-            echo "Scanning ${image}"
+      - name: Scan Checkout image with Trivy
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/retail-store-checkout:${{ env.IMAGE_TAG }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
 
-            trivy image \
-              --scanners vuln \
-              --severity HIGH,CRITICAL \
-              --ignore-unfixed \
-              --exit-code 0 \
-              "${image}"
-          done
-
-      - name: Push application images to Amazon ECR
+      - name: Push images to Amazon ECR
         shell: bash
         run: |
           set -euo pipefail
@@ -558,8 +533,7 @@ jobs:
           set -euo pipefail
 
           if [ ! -f "${GITOPS_MANIFEST}" ]; then
-            echo "GitOps manifest not found:"
-            echo "${GITOPS_MANIFEST}"
+            echo "GitOps manifest not found: ${GITOPS_MANIFEST}"
 
             echo
             echo "Available files:"
@@ -603,14 +577,14 @@ jobs:
 
             echo "Updating ${service} to ${new_image}"
 
-            # First pipeline deployment:
-            # replace the public ECR image.
+            # First pipeline execution:
+            # public ECR image → private ECR image.
             sed -i -E \
               "s|${public_images[$service]}:[^[:space:]\"']+|${new_image}|g" \
               "${file}"
 
-            # Subsequent pipeline deployments:
-            # replace the previous private ECR tag.
+            # Later executions:
+            # previous private ECR tag → new private ECR tag.
             sed -i -E \
               "s|${ECR_REGISTRY}/retail-store-${service}:[^[:space:]\"']+|${new_image}|g" \
               "${file}"
@@ -687,5 +661,5 @@ jobs:
             echo "- ECR registry: \`${ECR_REGISTRY}\`"
             echo "- GitOps repository: \`${GITOPS_REPOSITORY}\`"
             echo "- GitOps manifest: \`${GITOPS_MANIFEST}\`"
-            echo "- Argo CD will automatically deploy the GitOps commit."
+            echo "- Argo CD will deploy the GitOps commit automatically."
           } >> "${GITHUB_STEP_SUMMARY}"
